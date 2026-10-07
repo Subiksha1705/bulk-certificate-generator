@@ -112,4 +112,44 @@ Job-level validation enforces structural requirements (e.g., valid ISO event dat
 **Answer:**
 Client applications and user copy-pasting often introduce invisible whitespace noise, leading/trailing spaces, or varying capitalization (`SUBIKSHA@EXAMPLE.COM` vs `subiksha@example.com`). Normalizing text (stripping surrounding whitespace, collapsing internal multi-spaces, and case-folding emails) ensures consistent validation, prevents duplicate row false-negatives, and ensures accurate idempotency deduplication.
 
+---
+
+## Phase 3: PDF Generation, Visual Calibration & Glyph Fitting
+
+### 1. What was built
+- Decoupled coordinate and layout system in [app/services/layout.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/services/layout.py) mapping template top-left pixels (2000 × 1414 px) to A4 landscape PDF points (841.89 × 595.28 pt) with field-specific bounds (`FieldSpec`).
+- Deterministic ReportLab PDF generator in [app/services/certificate_generator.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/services/certificate_generator.py) with static TTF font registration, cached background template rendering, metadata injection, and `invariant=1` deterministic byte generation.
+- Dynamic font size auto-fitting and glyph inspection (`check_glyphs()`, `fit_font_size()`) that verifies character coverage in the font face and gracefully steps down font sizes (1 px per step) until text fits within field max widths, raising typed non-retryable exceptions (`UnsupportedCharacterError`, `TextOverflowError`).
+- PDF rendering and calibration script in [scripts/render_sample.py](file:///Users/subiksharamesh/bulk-certificate-generator/scripts/render_sample.py) creating sample, calibration (100px grid, baseline ticks, dashed max-width boxes), and stress test PDFs.
+- Pytest suite in [tests/test_generation.py](file:///Users/subiksharamesh/bulk-certificate-generator/tests/test_generation.py) (43 total passing tests).
+
+### 2. Why these choices were made
+- **Template Pixel Coordinates:** Specifying layout coordinates in template image pixels (origin top-left) rather than raw PDF points makes visual calibration intuitive: developers can measure exact pixel positions directly from graphic design tools (Canva/Photoshop) without manually computing PDF math.
+- **Deterministic PDF Generation (`invariant=1`):** Enabling ReportLab's `invariant=1` removes runtime timestamps and non-deterministic object IDs from PDF byte streams. Identical input always produces byte-identical PDFs, enabling the self-healing storage architecture (Phase 6) to regenerate missing files safely.
+- **Glyph Verification Before Rendering:** Checking `font.face.charToGlyph` catches unsupported emojis or non-Latin glyphs before ReportLab renders missing character boxes (`.notdef`), classifying them as non-retryable `VALIDATION` errors.
+- **Dynamic Auto-Shrink Font Fitting:** Stepping font size down to `min_px` ensures that long names (e.g. 40–50 characters) shrink gracefully to fit their designated lines instead of clipping or overlapping borders.
+
+### 3. How it works
+- `TemplateLayout` scales pixel dimensions by `PAGE_HEIGHT_PT / template_height_px` (≈ 0.421) and transforms the Y-axis (`pdf_y = PAGE_HEIGHT_PT - (pixel_y * scale)`).
+- When `generate_certificate_pdf()` is called, it loads the cached template image, draws it over the canvas, and loops through the field specifications.
+- Each text string is checked for glyph support and measured using `pdfmetrics.stringWidth`. If the text exceeds the field's `max_width_px`, the font size is iteratively reduced until it fits or reaches `min_px`.
+- The PDF is finalized to an in-memory byte buffer and returned.
+
+### 4. Likely Interview Questions & Answers
+
+#### Q1: How does the system ensure generated PDFs are 100% deterministic?
+**Answer:**
+ReportLab normally includes creation timestamps, file modification times, and random document ID hashes inside the PDF catalog dictionary. By setting `canvas.Canvas(..., invariant=1, pageCompression=1)` and avoiding any dynamic timestamps in rendering, two generation calls for the same certificate produce byte-for-byte identical binaries. This is critical for self-healing storage: if a PDF is deleted or lost on ephemeral cloud storage (e.g. Render), the server can regenerate the exact same file on demand.
+
+#### Q2: What happens when a recipient name is very long or contains special characters?
+**Answer:**
+1. **Character Check:** The text is first checked against the font's glyph mapping (`font.face.charToGlyph`). If unsupported characters (e.g. emoji or unsupported scripts) are present, `UnsupportedCharacterError` is raised.
+2. **Auto-fit:** If glyphs are supported, `fit_font_size` measures the text width in PDF points. If it exceeds `max_width_px`, font size steps down 1 px at a time until it fits or reaches `min_px`.
+3. **Overflow Guard:** If the text still exceeds max width at `min_px`, `TextOverflowError` is raised. Both exceptions inherit from `CertificateDataError` and are marked as non-retryable `VALIDATION` failures.
+
+#### Q3: How do you handle changing or resizing the certificate template background image?
+**Answer:**
+All coordinate specifications live in [app/services/layout.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/services/layout.py) in template pixels. `TemplateLayout` automatically inspects the template image dimensions via Pillow on startup and dynamically scales all pixel coordinates to A4 landscape PDF points. Changing the template design or dimensions requires updating numeric coordinates in `layout.py` without touching any rendering or business logic.
+
+
 

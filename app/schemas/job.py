@@ -15,6 +15,7 @@ from app.constants import (
     MIN_SIGNATORY_LENGTH,
 )
 from app.models.enums import JobStatus
+from app.services.certificate_generator import CertificateDataError, validate_text_renderable
 from app.services.validation import normalize_text
 
 
@@ -46,6 +47,10 @@ class JobCreate(BaseModel):
             raise ValueError(
                 f"event_name must be {MIN_EVENT_NAME_LENGTH}–{MAX_EVENT_NAME_LENGTH} chars"
             )
+        try:
+            validate_text_renderable(norm, "event_name")
+        except CertificateDataError as e:
+            raise ValueError(str(e)) from e
         return norm
 
     @field_validator("event_date")
@@ -69,6 +74,10 @@ class JobCreate(BaseModel):
                 f"{MAX_ORGANIZATION_NAME_LENGTH} chars"
             )
             raise ValueError(msg)
+        try:
+            validate_text_renderable(norm, "organization_name")
+        except CertificateDataError as e:
+            raise ValueError(str(e)) from e
         return norm
 
     @field_validator("authorized_signatory")
@@ -80,6 +89,10 @@ class JobCreate(BaseModel):
                 f"authorized_signatory must be {MIN_SIGNATORY_LENGTH}–{MAX_SIGNATORY_LENGTH} chars"
             )
             raise ValueError(msg)
+        try:
+            validate_text_renderable(norm, "authorized_signatory")
+        except CertificateDataError as e:
+            raise ValueError(str(e)) from e
         return norm
 
     @field_validator("recipients")
