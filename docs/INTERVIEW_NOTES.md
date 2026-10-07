@@ -39,3 +39,41 @@ Separating routers from services ensures strict separation of concerns. Routers 
 #### Q3: Why are static TTF fonts bundled directly in the repository rather than downloaded at runtime?
 **Answer:**
 Bundling the SIL OFL-licensed static fonts ensures deterministic, reproducible PDF generation in all environments (local, CI/CD, and production container/serverless environments like Render). Variable fonts or dynamic runtime downloads can fail due to network restrictions, rate limiting, or font rendering incompatibilities with ReportLab.
+
+---
+
+## Phase 1: Database Layer, ORM Models & Unguessable IDs
+
+### 1. What was built
+- Configured SQLAlchemy 2.0 database engine in [app/database.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/database.py) with connection recycling (`pool_recycle=300`) and pre-ping (`pool_pre_ping=True`) for Neon/Postgres, plus automatic fallback for SQLite in-memory tests (`StaticPool`).
+- Implemented ORM models in [app/models/job.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/models/job.py) (`GenerationJob`) and [app/models/certificate.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/models/certificate.py) (`Certificate`) using SQLAlchemy 2.0 type-annotated style (`Mapped[...]`, `mapped_column`), string enums, indexed foreign keys, and cascading delete relationships.
+- Defined domain enums in [app/models/enums.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/models/enums.py) (`JobStatus`, `CertificateStatus`, `FailureType`).
+- Implemented cryptographically secure, unguessable ID generation in [app/utils/ids.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/utils/ids.py) (`JOB-YYYY-XXXXXXXX` and `CERT-YYYY-XXXXXXXX`) using a 32-character unambiguous Base-32 alphabet (`ABCDEFGHJKLMNPQRSTUVWXYZ23456789`).
+- Wired automatic database schema creation (`Base.metadata.create_all`) into FastAPI lifespan and updated `GET /health` to perform active `SELECT 1` database health validation.
+- Built comprehensive test suite in [tests/test_models.py](file:///Users/subiksharamesh/bulk-certificate-generator/tests/test_models.py) and [tests/test_health.py](file:///Users/subiksharamesh/bulk-certificate-generator/tests/test_health.py) with isolated test databases.
+
+### 2. Why these choices were made
+- **Unguessable IDs as Primary Keys:** Sequential IDs (e.g. `CERT-1`, `CERT-2`) allow unauthorized users to scrape certificates and recipient names by enumerating endpoints. 8 random characters from a 32-character alphabet provides over 1 trillion combinations ($32^8 \approx 1.1 \times 10^{12}$ per year), making brute-force scanning infeasible while eliminating ambiguous characters (`0`, `O`, `1`, `I`).
+- **SQLAlchemy 2.0 `Mapped` Syntax:** Eliminates legacy string-based column definitions, giving complete IDE autocomplete, static type checking with Mypy/Pyright, and cleaner code.
+- **`native_enum=False`:** Storing enums as VARCHAR strings rather than PostgreSQL native enum types avoids complex database migrations when enum values change and enables seamless SQLite compatibility for local/in-memory unit tests.
+- **Pre-ping & Connection Recycling:** Serverless PostgreSQL (such as Neon free tier) closes idle connections aggressively when scaling to zero. `pool_pre_ping=True` and `pool_recycle=300` prevent stale connection errors on incoming requests.
+
+### 3. How it works
+- When the FastAPI application starts up, `Base.metadata.create_all(bind=engine)` creates the `generation_jobs` and `certificates` tables and their indexes if they do not already exist.
+- Each `GenerationJob` has a one-to-many relationship with `Certificate`, ordered by `row_number` and configured with `cascade="all, delete-orphan"`.
+- `/health` checks database connectivity with `db.execute(text("SELECT 1"))`. If the database is responsive, it returns HTTP 200 `{"status": "ok", "database": "ok"}`; on database failure, it catches the error and returns HTTP 503 `{"status": "error", "database": "error"}`.
+
+### 4. Likely Interview Questions & Answers
+
+#### Q1: Why use random 8-character string primary keys instead of auto-incrementing integers or UUIDv4?
+**Answer:**
+Auto-incrementing integers create an enumeration vulnerability for public endpoints (such as public certificate verification and download). Anyone could iterate through `CERT-1`, `CERT-2` to scrape recipient names and organization details. Standard UUIDv4 strings are 36 characters long, awkward to print on certificates or read aloud. An 8-character string from an unambiguous 32-character Base-32 alphabet ($32^8 \approx 1.1 \times 10^{12}$ combinations) provides high unguessability, fits cleanly on paper certificates, omits easily confused characters like `0/O` and `1/I`, and serves directly as the primary key without an extra translation table.
+
+#### Q2: Why configure `native_enum=False` for SQLAlchemy Enum columns?
+**Answer:**
+Native PostgreSQL ENUM types require specific DDL statements (`ALTER TYPE ... ADD VALUE`) to modify and are not natively supported by SQLite. Using `native_enum=False` stores the enum value as a standard `VARCHAR` column with validation handled at the Python/application layer. This allows the same codebase and test suite to run seamlessly across in-memory SQLite for fast unit testing and PostgreSQL in production without database migration friction.
+
+#### Q3: How do `pool_pre_ping` and `pool_recycle` prevent errors on serverless databases like Neon?
+**Answer:**
+Neon automatically scales idle database computes to zero to save resources, closing existing TCP sockets. If the application holds a pool of stale connections, the next incoming query would fail with a `BrokenPipeError` or `OperationalError`. `pool_pre_ping=True` issues a lightweight `SELECT 1` before checking out a connection from the pool, silently refreshing dead sockets. `pool_recycle=300` proactively retires connections older than 5 minutes.
+

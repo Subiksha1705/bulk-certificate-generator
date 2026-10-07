@@ -9,3 +9,6 @@ __pycache__/
 htmlcov/
 .DS_Store
 .ruff_cache/
+*.db
+*.sqlite
+*.sqlite3
