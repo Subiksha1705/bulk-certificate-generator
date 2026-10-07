@@ -151,5 +151,45 @@ ReportLab normally includes creation timestamps, file modification times, and ra
 **Answer:**
 All coordinate specifications live in [app/services/layout.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/services/layout.py) in template pixels. `TemplateLayout` automatically inspects the template image dimensions via Pillow on startup and dynamically scales all pixel coordinates to A4 landscape PDF points. Changing the template design or dimensions requires updating numeric coordinates in `layout.py` without touching any rendering or business logic.
 
+---
+
+## Phase 4: Storage Layer & Bulk Job Ingestion Endpoints
+
+### 1. What was built
+- Atomic local filesystem storage in [app/services/storage.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/services/storage.py) (`PdfStorage`) providing path-traversal-safe `save()` (write to temporary file and `os.replace`), `read()`, `exists()`, and `delete()`.
+- Job business logic in [app/services/job_service.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/services/job_service.py) handling batch ingestion, duplicate recipient isolation, counter recomputation (`recompute_counts()`), and race-safe database commits.
+- REST API router in [app/routers/jobs.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/routers/jobs.py) mounted under `/api` providing:
+  - `POST /api/jobs/`: Bulk submission endpoint returning HTTP 202 Accepted for new jobs and HTTP 200 OK for idempotent replays (`idempotent_replay: true`).
+  - `GET /api/jobs/{job_id}`: Job metadata, counters (`total`, `processed`, `successful`, `failed`), and progress percentage.
+  - `GET /api/jobs/{job_id}/certificates`: Paginated certificate list with optional status filtering (`?status=FAILED|PENDING|SUCCESS`).
+- Test suite in [tests/test_jobs.py](file:///Users/subiksharamesh/bulk-certificate-generator/tests/test_jobs.py) bringing total passing tests to 50.
+
+### 2. Why these choices were made
+- **Atomic File Replacement:** Direct in-place writes risk leaving corrupted or partial PDFs if the process crashes mid-write. Writing to a temp file on the same filesystem and swapping atomically via `os.replace()` guarantees that any readable file is complete and intact.
+- **Race-Safe Idempotency Handling:** If two identical bulk requests hit the server simultaneously, both compute the same `request_hash`. Database unique constraints on `request_hash` cause the losing transaction to raise `IntegrityError`. Catching this error, rolling back, and returning the existing job guarantees zero duplicate jobs without needing external distributed locks.
+- **Recipient Isolation at Ingestion:** Invalid recipients (bad email, blank name, duplicate row) are immediately marked as `FAILED` with `failure_type = VALIDATION` and error messages upon submission. Valid recipients remain `PENDING` for the background worker (Phase 5), preventing bad data from blocking valid certificates.
+- **Immediate Job Failure on 100% Bad Intake:** If every recipient in a batch is invalid, the job status is set to `FAILED` immediately upon creation with `completed_at` populated, avoiding scheduling unnecessary background worker tasks.
+
+### 3. How it works
+- `POST /api/jobs/` calculates the canonical SHA-256 hash of the request.
+- If a job with that hash already exists, it immediately returns the existing record with HTTP 200 and `idempotent_replay: true`.
+- If new, it validates all recipient rows, creates the `GenerationJob` and `Certificate` rows in one database transaction, recomputes counters, and returns HTTP 202 Accepted with hypermedia navigation links (`links.self`, `links.certificates`).
+- Note: At Phase 4, valid certificates stay in `PENDING` status; asynchronous PDF generation and worker processing are activated in Phase 5.
+
+### 4. Likely Interview Questions & Answers
+
+#### Q1: What happens if two identical requests arrive simultaneously?
+**Answer:**
+Both requests compute the same `request_hash`. When both attempt to insert into the `generation_jobs` table, PostgreSQL/SQLite's unique constraint on `request_hash` permits one transaction to commit. The second transaction encounters an `IntegrityError`. `job_service.create_job()` catches `IntegrityError`, performs a rollback, queries the winning job record by `request_hash`, and returns it with HTTP 200 OK and `idempotent_replay: true`. This prevents duplicate job creation and eliminates race conditions without distributed locks.
+
+#### Q2: Why does `POST /api/jobs/` return HTTP 202 Accepted instead of 200 OK or 201 Created?
+**Answer:**
+HTTP 202 Accepted indicates that the bulk request has been validated and queued for asynchronous background generation, but processing has not yet finished. The client receives a `job_id` and a polling URL (`links.self`) to track live progress (`GET /api/jobs/{job_id}`). When an exact duplicate payload is resubmitted, the API returns HTTP 200 OK with `idempotent_replay: true` to indicate that an existing completed/processing job was retrieved.
+
+#### Q3: Why does `PdfStorage` use atomic writes (`os.replace`) instead of standard `open(path, 'wb')`?
+**Answer:**
+If the server crashes, reboots, or runs out of memory while writing a PDF file to disk, a direct write leaves a zero-byte or corrupted file. By writing to a `NamedTemporaryFile` in the target directory and renaming it via `os.replace()`, the operating system makes the directory entry update an atomic metadata operation. Any thread or process that sees the file will always read a complete, uncorrupted PDF.
+
+
 
 

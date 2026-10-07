@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 import app.models
 from app.database import Base, engine, get_db
+from app.routers import jobs
 
 
 @asynccontextmanager
@@ -23,6 +24,9 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# Register API routers
+app.include_router(jobs.router, prefix="/api")
 
 
 @app.get("/health", tags=["Health"])
