@@ -77,3 +77,39 @@ Native PostgreSQL ENUM types require specific DDL statements (`ALTER TYPE ... AD
 **Answer:**
 Neon automatically scales idle database computes to zero to save resources, closing existing TCP sockets. If the application holds a pool of stale connections, the next incoming query would fail with a `BrokenPipeError` or `OperationalError`. `pool_pre_ping=True` issues a lightweight `SELECT 1` before checking out a connection from the pool, silently refreshing dead sockets. `pool_recycle=300` proactively retires connections older than 5 minutes.
 
+---
+
+## Phase 2: Input Schemas, Validation & Request Fingerprinting
+
+### 1. What was built
+- Pure validation engine in [app/services/validation.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/services/validation.py) validating individual recipient names and emails (`NAME_REQUIRED`, `NAME_TOO_SHORT`, `NAME_TOO_LONG`, `NAME_INVALID_CHARS`, `EMAIL_REQUIRED`, `EMAIL_INVALID`) and detecting case-insensitive duplicate rows (`DUPLICATE_ROW`).
+- Pydantic v2 schemas in [app/schemas/job.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/schemas/job.py) and [app/schemas/certificate.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/schemas/certificate.py) for request payloads (`JobCreate`, `RecipientIn`) and responses (`JobOut`, `JobCreateResponse`, `CertificateOut`, `CertificateListOut`, `VerifyOut`).
+- Deterministic request fingerprinting engine in [app/services/fingerprint.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/services/fingerprint.py) calculating SHA-256 request hashes invariant to recipient sorting or case/whitespace variations.
+- Unit test suite in [tests/test_validation.py](file:///Users/subiksharamesh/bulk-certificate-generator/tests/test_validation.py) and [tests/test_fingerprint.py](file:///Users/subiksharamesh/bulk-certificate-generator/tests/test_fingerprint.py) covering all validation bounds, regexes, duplicates, and hash invariances.
+
+### 2. Why these choices were made
+- **Dual Validation Boundary:** Structural errors (missing payload fields, non-object recipient items, date out of bounds) fail fast with HTTP 422. Recipient data quality errors (invalid email format, blank names, duplicate rows) do NOT reject the whole batch; they are recorded per recipient as `FAILED/VALIDATION` so valid certificates are never blocked.
+- **Pure Functions Without Side Effects:** Writing validation and fingerprinting as pure functions (zero DB and zero HTTP dependencies) guarantees 100% deterministic, high-speed unit testing.
+- **Order-Insensitive Content Hashing:** Sorting normalized `(casefold_name, casefold_email)` pairs before SHA-256 hashing guarantees that resubmissions with rearranged recipient rows are recognized as identical requests for idempotency.
+- **`extra="forbid"` on JobCreate:** Catches client field typos (e.g. `date` instead of `event_date`) immediately at the HTTP boundary before database ingestion.
+
+### 3. How it works
+- `JobCreate` validates job metadata (length bounds, date ranges) and parses `recipients: list[RecipientIn]`.
+- `validate_recipients()` iterates through recipients, normalizes names and emails, validates constraints, detects duplicate rows using a hash set, and produces `RecipientCheck` objects with error details.
+- `compute_request_hash()` builds a canonical dictionary of normalized job metadata and sorted recipient tuples, converts to compact JSON (`separators=(',', ':')`), and computes a 64-character SHA-256 hex digest.
+
+### 4. Likely Interview Questions & Answers
+
+#### Q1: What is the difference between job-level validation and recipient-level validation?
+**Answer:**
+Job-level validation enforces structural requirements (e.g., valid ISO event date, non-empty recipient list, required event/organization names). If any job-level rule fails, FastAPI rejects the entire request with HTTP 422. In contrast, recipient-level validation isolates individual data problems (such as a malformed email or duplicate row). Rather than aborting the entire batch of 500 recipients because of one typo, invalid recipients are recorded as `FAILED` with `failure_type = VALIDATION` and specific error messages, while valid recipients proceed to certificate generation.
+
+#### Q2: How does the request fingerprinting algorithm guarantee idempotency even if recipient rows are reordered?
+**Answer:**
+`compute_request_hash()` extracts each recipient as a normalized, case-folded pair `(name, email)`. Before serializing the payload to canonical JSON, the list of recipient pairs is sorted lexicographically. This ensures that two requests with identical content in different orders produce identical JSON strings, resulting in the exact same SHA-256 hash.
+
+#### Q3: Why normalize strings before hashing and validation?
+**Answer:**
+Client applications and user copy-pasting often introduce invisible whitespace noise, leading/trailing spaces, or varying capitalization (`SUBIKSHA@EXAMPLE.COM` vs `subiksha@example.com`). Normalizing text (stripping surrounding whitespace, collapsing internal multi-spaces, and case-folding emails) ensures consistent validation, prevents duplicate row false-negatives, and ensures accurate idempotency deduplication.
+
+

@@ -4,7 +4,10 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "PIE", "RUF"]
-ignore = ["B008"]  # Allow FastAPI Depends in function defaults
+ignore = [
+    "B008",    # Allow FastAPI Depends in function defaults
+    "RUF001",  # Allow unicode characters (like EN DASH) in string literals
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
