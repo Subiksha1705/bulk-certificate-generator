@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.models.enums import CertificateStatus, FailureType
+from app.models.enums import CertificateStatus, FailureType, JobStatus
 from app.models.job import GenerationJob
 
 
@@ -39,22 +39,23 @@ def test_create_job_success_and_recipient_isolation(
     assert data["links"]["self"] == f"/api/jobs/{data['job_id']}"
     assert data["links"]["certificates"] == f"/api/jobs/{data['job_id']}/certificates"
 
-    # Verify database persistence
+    # Verify database persistence (after background processing completes)
     job = db_session.get(GenerationJob, data["job_id"])
     assert job is not None
     assert len(job.certificates) == 3
+    assert job.status == JobStatus.COMPLETED_WITH_ERRORS
 
-    # Row 1 (valid)
+    # Row 1 (valid -> processed to SUCCESS)
     assert job.certificates[0].row_number == 1
     assert job.certificates[0].recipient_name == "Subiksha P R"
-    assert job.certificates[0].status == CertificateStatus.PENDING
+    assert job.certificates[0].status == CertificateStatus.SUCCESS
     assert job.certificates[0].failure_type is None
 
-    # Row 2 (valid)
+    # Row 2 (valid -> processed to SUCCESS)
     assert job.certificates[1].row_number == 2
-    assert job.certificates[1].status == CertificateStatus.PENDING
+    assert job.certificates[1].status == CertificateStatus.SUCCESS
 
-    # Row 3 (invalid at intake)
+    # Row 3 (invalid at intake -> FAILED / VALIDATION)
     assert job.certificates[2].row_number == 3
     assert job.certificates[2].status == CertificateStatus.FAILED
     assert job.certificates[2].failure_type == FailureType.VALIDATION
@@ -197,10 +198,11 @@ def test_list_job_certificates_endpoint(client: TestClient) -> None:
     assert list_failed.json()["certificates"][0]["failure_type"] == "VALIDATION"
     assert list_failed.json()["certificates"][0]["view_url"] is None
 
-    # 3. Filter by status=PENDING (2 matches)
-    list_pending = client.get(f"/api/jobs/{job_id}/certificates?status=PENDING")
-    assert list_pending.status_code == 200
-    assert list_pending.json()["total"] == 2
+    # 3. Filter by status=SUCCESS (2 matches)
+    list_success = client.get(f"/api/jobs/{job_id}/certificates?status=SUCCESS")
+    assert list_success.status_code == 200
+    assert list_success.json()["total"] == 2
+    assert list_success.json()["certificates"][0]["view_url"] is not None
 
     # 4. Pagination limit=1
     page1 = client.get(f"/api/jobs/{job_id}/certificates?limit=1&offset=0")

@@ -190,6 +190,54 @@ HTTP 202 Accepted indicates that the bulk request has been validated and queued 
 **Answer:**
 If the server crashes, reboots, or runs out of memory while writing a PDF file to disk, a direct write leaves a zero-byte or corrupted file. By writing to a `NamedTemporaryFile` in the target directory and renaming it via `os.replace()`, the operating system makes the directory entry update an atomic metadata operation. Any thread or process that sees the file will always read a complete, uncorrupted PDF.
 
+---
+
+## Phase 5: Background Processing, Failure Isolation & Crash Recovery
+
+### 1. What was built
+- **Certificate Data Mapping** in [app/services/certificate_service.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/services/certificate_service.py) (`build_certificate_data`): Central function converting DB entities to generator payloads (`CertificateData`) with dynamic verification URLs.
+- **Background Worker Engine** in [app/services/job_processor.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/services/job_processor.py) (`process_job`):
+  - Opens an isolated database session per background worker.
+  - Queries pending certificates in batches of 50 by ID to keep memory usage constant ($O(1)$).
+  - Increments attempts, calls the PDF generator, and saves the binary via `PdfStorage`.
+  - Commits to the database after each individual certificate, providing live real-time progress.
+  - Failure isolation: `CertificateDataError` becomes `FAILED/VALIDATION`, while any other runtime exception becomes `FAILED/GENERATION` without crashing the batch.
+  - Finalizes job status (`COMPLETED`, `COMPLETED_WITH_ERRORS`, or `FAILED`) when no pending certificates remain.
+- **Automatic Crash Recovery** (`recover_interrupted_jobs`): Finds jobs in `PENDING` or `PROCESSING` state with unfinished certificates on application startup (via FastAPI lifespan in [app/main.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/main.py)) and finishes them in background worker threads.
+- **Test Payload Generator CLI** in [scripts/generate_payload.py](file:///Users/subiksharamesh/bulk-certificate-generator/scripts/generate_payload.py) for testing small to large batches (e.g., `--count 300 --invalid 5`).
+- **Integration Test Suites** in [tests/test_processing.py](file:///Users/subiksharamesh/bulk-certificate-generator/tests/test_processing.py) and [tests/test_recovery.py](file:///Users/subiksharamesh/bulk-certificate-generator/tests/test_recovery.py) bringing total passing tests to 58.
+
+### 2. Why these choices were made
+- **Isolated DB Session in Workers:** Never reuse the HTTP request's session in a background task; the request session closes immediately upon returning HTTP 202, which would cause `Session closed` or thread-concurrency race conditions.
+- **Per-Certificate Database Commits:** Committing after every certificate ensures that UI pollers see real-time incrementing progress (`processed`, `successful`, `failed`), and if the worker crashes midway, already generated certificates are never lost or re-rendered.
+- **Batch Re-Querying (50 at a time):** Avoids loading thousands of ORM objects into memory at once for large batches (1000 recipients), ensuring flat memory footprint.
+- **Individual Failure Isolation:** A single malformed recipient or PDF rendering error catches locally, logs the traceback, and flags only that certificate as `FAILED`, allowing all other certificates in the batch to generate successfully.
+- **Startup Crash Recovery:** If the container or server restarts while a batch is in-flight, `recover_interrupted_jobs()` queries the database for incomplete batches and resumes generation automatically.
+
+### 3. How it works
+- `POST /api/jobs/` enqueues `process_job(job_id, session_factory)` into FastAPI's `BackgroundTasks`.
+- `process_job` opens its own DB session, marks the job `PROCESSING`, and processes `PENDING` certificates in order of `row_number`.
+- Each certificate is rendered, saved atomically to storage, and committed with updated job counters.
+- If all pending certificates are completed, the job transitions to `COMPLETED` (if 0 failures), `COMPLETED_WITH_ERRORS` (if partial failures), or `FAILED` (if 0 successes).
+- On server startup, FastAPI's `lifespan` triggers `recover_interrupted_jobs`, resuming any interrupted jobs seamlessly.
+
+### 4. Likely Interview Questions & Answers
+
+#### Q1: Why commit after every single certificate instead of committing the entire batch at the end?
+**Answer:**
+Committing per certificate provides two crucial benefits:
+1. **Live Visibility:** Clients polling `GET /api/jobs/{job_id}` see immediate progress increments rather than waiting for the entire batch to finish.
+2. **Crash Resilience:** If the server is killed or restarts midway through a 500-certificate batch (e.g., at certificate 250), the first 250 certificates remain saved as `SUCCESS` in the database with their PDF files on disk. Upon server restart, the crash recovery mechanism picks up only the remaining 250 `PENDING` certificates without duplicating effort or wasting compute.
+
+#### Q2: Why does the background task open its own database session rather than reusing the session from the request?
+**Answer:**
+In FastAPI, dependencies like `db: Session = Depends(get_db)` yield a session whose lifecycle is tied to the HTTP request. Once the endpoint returns the HTTP 202 Accepted response, the `get_db` generator's `finally` block runs and closes the session. If a background task attempted to use that session, it would fail with a `Session is closed` error or cause race conditions if the connection was returned to the pool while worker threads were querying. Passing a `sessionmaker` factory allows the worker to open, manage, and close its own independent database session.
+
+#### Q3: How does the system isolate failures so one bad recipient does not break the entire bulk job?
+**Answer:**
+Inside the batch loop in `process_job`, certificate generation is wrapped in an individual `try/except` block. If `build_certificate_data` raises `CertificateDataError`, the certificate is marked `FAILED` with `failure_type = VALIDATION`. If ReportLab throws an unhandled exception (e.g. font glyph error or layout overflow), it is caught, logged with full stack trace, and marked `FAILED` with `failure_type = GENERATION`. In all cases, the error message is recorded, the job counters are recomputed, and execution immediately proceeds to the next recipient.
+
+
 
 
 

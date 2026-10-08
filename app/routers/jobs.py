@@ -1,11 +1,21 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy.orm import Session
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Query,
+    Response,
+    status,
+)
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.database import get_db
-from app.models.enums import CertificateStatus
+from app.dependencies import get_session_factory
+from app.models.enums import CertificateStatus, JobStatus
 from app.schemas.certificate import CertificateListOut, CertificateOut
 from app.schemas.job import JobCreate, JobCreateResponse, JobOut
 from app.services import job_service
+from app.services.job_processor import process_job
 
 router = APIRouter(prefix="/jobs", tags=["Jobs"])
 
@@ -19,7 +29,9 @@ router = APIRouter(prefix="/jobs", tags=["Jobs"])
 def create_job_endpoint(
     payload: JobCreate,
     response: Response,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
+    session_factory: sessionmaker[Session] = Depends(get_session_factory),
 ) -> JobCreateResponse:
     """
     Submit a bulk certificate generation request.
@@ -28,6 +40,9 @@ def create_job_endpoint(
     job, created = job_service.create_job(db, payload)
     if not created:
         response.status_code = status.HTTP_200_OK
+    elif job.status != JobStatus.FAILED:
+        # Schedule background generation if there is at least one valid recipient
+        background_tasks.add_task(process_job, job.job_id, session_factory)
 
     return JobCreateResponse.from_job_model(job, idempotent_replay=not created)
 
