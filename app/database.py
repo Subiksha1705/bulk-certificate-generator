@@ -15,6 +15,11 @@ def get_engine_and_session_factory(database_url: str | None = None):
     """Create database engine and sessionmaker based on the provided or configured URL."""
     url = database_url or get_settings().DATABASE_URL
 
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+psycopg2://", 1)
+    elif url.startswith("postgresql://") and not url.startswith("postgresql+"):
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+
     if url.startswith("sqlite"):
         engine_kwargs: dict = {
             "connect_args": {"check_same_thread": False},
