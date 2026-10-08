@@ -7,15 +7,18 @@ from fastapi import (
     Response,
     status,
 )
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.database import get_db
-from app.dependencies import get_session_factory
+from app.dependencies import get_session_factory, get_storage
 from app.models.enums import CertificateStatus, JobStatus
 from app.schemas.certificate import CertificateListOut, CertificateOut
 from app.schemas.job import JobCreate, JobCreateResponse, JobOut
 from app.services import job_service
 from app.services.job_processor import process_job
+from app.services.storage import PdfStorage
+from app.services.zip_export import create_job_zip
 
 router = APIRouter(prefix="/jobs", tags=["Jobs"])
 
@@ -100,4 +103,54 @@ def list_job_certificates_endpoint(
         limit=limit,
         offset=offset,
         certificates=[CertificateOut.from_certificate_model(c) for c in certs],
+    )
+
+
+@router.get(
+    "/{job_id}/download-all",
+    summary="Download all successful certificates and results CSV as a ZIP archive",
+    responses={
+        200: {
+            "content": {"application/zip": {}},
+            "description": "ZIP archive containing results.csv and all SUCCESS PDFs",
+        },
+        404: {"description": "Job not found"},
+        409: {"description": "No successful certificates available"},
+    },
+)
+def download_all_job_certificates_endpoint(
+    job_id: str,
+    db: Session = Depends(get_db),
+    storage: PdfStorage = Depends(get_storage),
+) -> StreamingResponse:
+    """Stream a ZIP archive containing all generated certificates and results.csv."""
+    job = job_service.get_job_by_id(db, job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job '{job_id}' not found",
+        )
+
+    try:
+        spooled_zip = create_job_zip(db=db, job=job, storage=storage)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
+    def iter_file(file_obj, chunk_size=64 * 1024):
+        try:
+            while chunk := file_obj.read(chunk_size):
+                yield chunk
+        finally:
+            file_obj.close()
+
+    filename = f"{job.job_id}.zip"
+    return StreamingResponse(
+        iter_file(spooled_zip),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
     )

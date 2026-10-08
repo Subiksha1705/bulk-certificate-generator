@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 import app.models
 from app.config import get_settings
 from app.database import Base, SessionLocal, engine, get_db
-from app.routers import jobs
+from app.routers import certificates, jobs
 from app.services.certificate_generator import register_fonts
 from app.services.job_processor import recover_interrupted_jobs
 
@@ -55,6 +55,7 @@ app = FastAPI(
 
 # Register API routers
 app.include_router(jobs.router, prefix="/api")
+app.include_router(certificates.router, prefix="/api")
 
 
 @app.get("/health", tags=["Health"])

@@ -237,6 +237,53 @@ In FastAPI, dependencies like `db: Session = Depends(get_db)` yield a session wh
 **Answer:**
 Inside the batch loop in `process_job`, certificate generation is wrapped in an individual `try/except` block. If `build_certificate_data` raises `CertificateDataError`, the certificate is marked `FAILED` with `failure_type = VALIDATION`. If ReportLab throws an unhandled exception (e.g. font glyph error or layout overflow), it is caught, logged with full stack trace, and marked `FAILED` with `failure_type = GENERATION`. In all cases, the error message is recorded, the job counters are recomputed, and execution immediately proceeds to the next recipient.
 
+---
+
+## Phase 6: Retrieval, Self-Healing, Download & ZIP Export
+
+### 1. What was built
+- **Self-Healing PDF Retrieval Engine** in [app/services/certificate_service.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/services/certificate_service.py) (`get_or_regenerate_pdf`):
+  - Checks if the requested PDF exists on disk.
+  - If missing or unreadable (e.g. disk wipe, container recreation, ephemeral filesystem reset), it automatically reconstructs data from the database, re-renders the PDF deterministically, saves it back to storage, and returns the binary.
+  - Generates sanitized filesystem slugs (`slugify_recipient_name`) for attachments and ZIP filenames.
+- **Certificate Retrieval Router** in [app/routers/certificates.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/routers/certificates.py):
+  - `GET /api/certificates/{id}`: Returns certificate metadata (`CertificateOut`).
+  - `GET /api/certificates/{id}/view`: Displays PDF inline in browser (`Content-Disposition: inline`, `X-Content-Type-Options: nosniff`).
+  - `GET /api/certificates/{id}/download`: Downloads PDF attachment with sanitized filename `Certificate_{slug}_{id}.pdf`.
+  - Proper error handling: HTTP 404 for unknown certificates, HTTP 409 Conflict if certificate status is not `SUCCESS`.
+- **Memory-Efficient Streaming ZIP Exporter** in [app/services/zip_export.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/services/zip_export.py) and `GET /api/jobs/{id}/download-all`:
+  - Builds ZIP archives in a `SpooledTemporaryFile` (preventing unbounded RAM usage for large batches).
+  - Includes `results.csv` with full batch breakdown and **CSV formula injection defense** (`sanitize_csv_cell` prefixes formula triggers `=, +, -, @, \t, \r` with `'`).
+  - Streams `{job_id}.zip` containing all `SUCCESS` certificates formatted as `{row:04d}_{slug}_{id}.pdf`.
+  - Self-heals any missing certificate files on the fly during ZIP compilation.
+- **Unit & Integration Test Suite** in [tests/test_certificates.py](file:///Users/subiksharamesh/bulk-certificate-generator/tests/test_certificates.py) bringing total passing tests to 65.
+
+### 2. Why these choices were made
+- **Transparent Self-Healing (Disk Wipe Resilience):** Cloud deployments (like Render or containerized environments) often use ephemeral local storage that resets on redeployment. Rather than failing downloads when storage is empty, `get_or_regenerate_pdf` guarantees that as long as the database is intact, any successful certificate can be regenerated deterministically and served immediately.
+- **`SpooledTemporaryFile` for ZIP Bundles:** Creating a 1000-PDF ZIP archive entirely in memory (`io.BytesIO`) could exhaust available RAM and trigger out-of-memory (OOM) kills. `SpooledTemporaryFile` keeps small archives in memory and automatically spills larger ones to disk.
+- **CSV Formula Injection Protection:** When opening exported CSV files in Excel or Google Sheets, formulas beginning with `=`, `+`, `-`, or `@` can execute malicious commands or exfiltrate data. Prefixing these characters with a single quote (`'`) prevents spreadsheet formula execution.
+- **Sanitized Attachment Filenames & Content Headers:** `X-Content-Type-Options: nosniff` prevents MIME-type sniffing attacks, and slugifying recipient names ensures clean cross-platform filenames across Windows, macOS, and Linux.
+
+### 3. How it works
+- When a user views or downloads a certificate, the router verifies its status is `SUCCESS`.
+- `get_or_regenerate_pdf` checks `storage.read()`. If the file is present, it returns immediately. If missing, it fetches the parent job, re-renders the PDF with ReportLab, writes it back via atomic `PdfStorage.save()`, and serves the response.
+- `GET /api/jobs/{job_id}/download-all` collects all recipient records, writes `results.csv`, bundles each successful PDF into a ZIP stream, and streams the archive to the client with `StreamingResponse`.
+
+### 4. Likely Interview Questions & Answers
+
+#### Q1: What is "self-healing" storage and why is it critical for cloud deployments?
+**Answer:**
+Many modern cloud container platforms (such as Render, Fly.io, or Heroku free/ephemeral tiers) provide ephemeral local disk storage that is wiped on every deploy or restart. If generated PDF files are stored on ephemeral disk without persistent block storage, all previously generated PDFs would disappear upon restart. With self-healing storage, when a user requests `/view`, `/download`, or `/download-all`, the system checks if the file exists on disk. If missing, it transparently re-renders the PDF from the database models using the deterministic layout engine, saves it back to disk, and serves it seamlessly. The client experiences zero disruption.
+
+#### Q2: How do you prevent CSV Injection (Formula Injection) in bulk export files?
+**Answer:**
+Spreadsheet programs like Microsoft Excel, LibreOffice, and Google Sheets treat cells starting with `=, +, -, @` as executable formulas. If an attacker submits a recipient name like `=cmd|' /C calc'!A0`, opening `results.csv` could execute arbitrary system commands. In `app/services/zip_export.py`, the `sanitize_csv_cell()` helper inspects every cell string and prefixes any formula trigger characters with a single quote (`'`). This instructs spreadsheet applications to treat the cell purely as plain text.
+
+#### Q3: Why stream the ZIP file using `SpooledTemporaryFile` instead of building it in memory?
+**Answer:**
+A job with 1,000 certificates can easily exceed 50–100 MB of uncompressed PDF binaries. Building this entire archive in a standard `io.BytesIO` buffer puts heavy pressure on the process memory, which can lead to Out-Of-Memory (OOM) container crashes under concurrent requests. `tempfile.SpooledTemporaryFile(max_size=10MB)` stores small archives in RAM for speed, but automatically rolls over to temporary disk storage if the archive exceeds 10 MB, keeping application memory usage bounded and predictable.
+
+
 
 
 
