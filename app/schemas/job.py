@@ -170,3 +170,14 @@ class JobCreateResponse(JobOut):
     def from_job_model(cls, job: Any, idempotent_replay: bool = False) -> "JobCreateResponse":
         base = JobOut.from_job_model(job)
         return cls(**base.model_dump(), idempotent_replay=idempotent_replay)
+
+
+class JobRetryResponse(BaseModel):
+    """Response returned upon POST /api/jobs/{id}/retry-failed."""
+
+    job_id: str
+    retried_count: int
+    skipped_non_retryable: int
+    status: JobStatus
+
+    model_config = ConfigDict(from_attributes=True)

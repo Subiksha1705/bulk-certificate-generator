@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -161,3 +161,89 @@ def list_certificates(
     certificates = list(db.scalars(page_query).all())
 
     return total, certificates
+
+
+class JobNotFoundError(Exception):
+    """Raised when the requested job ID does not exist."""
+
+
+class JobNotRetryableError(Exception):
+    """Raised when a job cannot be retried (e.g. still processing, or only validation failures)."""
+
+
+def retry_failed(db: Session, job_id: str) -> tuple[GenerationJob, int, int]:
+    """
+    Reset FAILED generation certificates to PENDING and advance job to PROCESSING.
+    Uses an atomic conditional update to guarantee idempotent locks across concurrent retries.
+    Returns (job, retried_count, skipped_non_retryable).
+    """
+    job = db.get(GenerationJob, job_id)
+    if job is None:
+        raise JobNotFoundError(f"Job '{job_id}' not found")
+
+    if job.status in (JobStatus.PENDING, JobStatus.PROCESSING):
+        raise JobNotRetryableError("Cannot retry a job that is still processing")
+
+    if job.status == JobStatus.COMPLETED:
+        raise JobNotRetryableError("Job has already completed with 0 errors; nothing to retry")
+
+    # Atomic conditional update to claim retry lock
+    stmt = (
+        update(GenerationJob)
+        .where(
+            GenerationJob.job_id == job_id,
+            GenerationJob.status.in_([JobStatus.COMPLETED_WITH_ERRORS, JobStatus.FAILED]),
+        )
+        .values(status=JobStatus.PROCESSING, completed_at=None)
+    )
+    result = db.execute(stmt)
+    if result.rowcount == 0:
+        raise JobNotRetryableError("Job is already being retried or its status changed")
+
+    # Inspect failure types
+    validation_failures = list(
+        db.scalars(
+            select(Certificate).where(
+                Certificate.job_id == job_id,
+                Certificate.status == CertificateStatus.FAILED,
+                Certificate.failure_type == FailureType.VALIDATION,
+            )
+        ).all()
+    )
+
+    generation_failures = list(
+        db.scalars(
+            select(Certificate).where(
+                Certificate.job_id == job_id,
+                Certificate.status == CertificateStatus.FAILED,
+                Certificate.failure_type == FailureType.GENERATION,
+            )
+        ).all()
+    )
+
+    if not generation_failures:
+        # Revert status back
+        prev_status = (
+            JobStatus.COMPLETED_WITH_ERRORS if job.successful_count > 0 else JobStatus.FAILED
+        )
+        job.status = prev_status
+        db.commit()
+        val_count = len(validation_failures)
+        msg = (
+            f"No retryable generation failures found. {val_count} validation failure(s) "
+            "require a corrected resubmission."
+        )
+        raise JobNotRetryableError(msg)
+
+    # Reset retryable generation failures to PENDING (keep attempts count)
+    for cert in generation_failures:
+        cert.status = CertificateStatus.PENDING
+        cert.failure_type = None
+        cert.error_message = None
+        cert.completed_at = None
+
+    recompute_counts(db, job)
+    db.commit()
+    db.refresh(job)
+
+    return job, len(generation_failures), len(validation_failures)

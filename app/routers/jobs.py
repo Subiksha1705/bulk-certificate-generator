@@ -14,7 +14,7 @@ from app.database import get_db
 from app.dependencies import get_session_factory, get_storage
 from app.models.enums import CertificateStatus, JobStatus
 from app.schemas.certificate import CertificateListOut, CertificateOut
-from app.schemas.job import JobCreate, JobCreateResponse, JobOut
+from app.schemas.job import JobCreate, JobCreateResponse, JobOut, JobRetryResponse
 from app.services import job_service
 from app.services.job_processor import process_job
 from app.services.storage import PdfStorage
@@ -153,4 +153,48 @@ def download_all_job_certificates_endpoint(
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
         },
+    )
+
+
+@router.post(
+    "/{job_id}/retry-failed",
+    response_model=JobRetryResponse,
+    summary="Retry failed generation certificates in a job",
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={
+        202: {"description": "Retry accepted and scheduled in background"},
+        404: {"description": "Job not found"},
+        409: {
+            "description": "Job cannot be retried (e.g. still processing or no retryable failures)"
+        },
+    },
+)
+def retry_failed_job_endpoint(
+    job_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    session_factory: sessionmaker[Session] = Depends(get_session_factory),
+) -> JobRetryResponse:
+    """Reset transient generation failures to PENDING and resume background generation."""
+    try:
+        job, retried_count, skipped_count = job_service.retry_failed(db=db, job_id=job_id)
+    except job_service.JobNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except job_service.JobNotRetryableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
+    # Enqueue background task to process the reset certificates
+    background_tasks.add_task(process_job, job.job_id, session_factory)
+
+    return JobRetryResponse(
+        job_id=job.job_id,
+        retried_count=retried_count,
+        skipped_non_retryable=skipped_count,
+        status=job.status,
     )

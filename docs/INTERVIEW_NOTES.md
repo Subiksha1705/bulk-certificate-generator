@@ -283,6 +283,52 @@ Spreadsheet programs like Microsoft Excel, LibreOffice, and Google Sheets treat 
 **Answer:**
 A job with 1,000 certificates can easily exceed 50–100 MB of uncompressed PDF binaries. Building this entire archive in a standard `io.BytesIO` buffer puts heavy pressure on the process memory, which can lead to Out-Of-Memory (OOM) container crashes under concurrent requests. `tempfile.SpooledTemporaryFile(max_size=10MB)` stores small archives in RAM for speed, but automatically rolls over to temporary disk storage if the archive exceeds 10 MB, keeping application memory usage bounded and predictable.
 
+---
+
+## Phase 7: Selective Retry Mechanism & Demo Failure Switch
+
+### 1. What was built
+- **Demo Failure Switch (`ENABLE_DEMO_FAILURES`)** in [app/services/job_processor.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/services/job_processor.py):
+  - Injected into the background job processor worker loop.
+  - When `ENABLE_DEMO_FAILURES=True` (or in test/demo mode), recipient names starting with `FAILME` fail on `attempts == 1` with simulated `RuntimeError` (`failure_type=GENERATION`).
+  - On retry (`attempts == 2`), the failure condition resolves and PDF generation succeeds.
+- **Selective Retry Endpoint & Logic** in [app/routers/jobs.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/routers/jobs.py) and [app/services/job_service.py](file:///Users/subiksharamesh/bulk-certificate-generator/app/services/job_service.py):
+  - `POST /api/jobs/{job_id}/retry-failed`: Accepts retry requests and schedules background reprocessing (`HTTP 202 Accepted`).
+  - Selective isolation: Only certificates with `status == FAILED` and `failure_type == GENERATION` are reset to `PENDING` and retried.
+  - Untouched states: `SUCCESS` certificates (and validation failures like bad email / empty name) are NOT re-rendered or duplicated.
+  - Concurrency Lock & Idempotency: Uses atomic conditional SQL update (`UPDATE generation_jobs SET status='PROCESSING' WHERE job_id=:id AND status IN ('COMPLETED_WITH_ERRORS', 'FAILED')`) to block concurrent double-retries.
+  - Returns `404` for missing jobs, and `409 Conflict` if the job is still processing, already fully completed, or contains only non-retryable validation failures.
+- **Comprehensive Unit & Integration Tests** in [tests/test_retry.py](file:///Users/subiksharamesh/bulk-certificate-generator/tests/test_retry.py) verifying retry flows, demo failure switch, idempotency, non-retryable exclusions, and race condition guards.
+
+### 2. Why these choices were made
+- **Selective Retry (Skipping Validation Errors):** A certificate that failed intake validation (e.g. malformed email address or invalid characters) cannot magically succeed upon retry without user input corrections. Retrying validation errors would waste CPU cycles and compute resources. Retrying only transient `GENERATION` errors focuses computing power where recovery is actually possible.
+- **Atomic Database Locks for Retries:** If two admin users (or an automated script) click "Retry Failed" at the exact same instant, naive reads could cause race conditions where certificates are double-processed or duplicate background workers run. An atomic `UPDATE` with rowcount check ensures only one worker acquires the processing lock.
+- **Untouched Success Certificates:** Re-generating certificates that already succeeded would be wasteful and risk generating inconsistent timestamps or modifying existing files.
+
+### 3. How it works
+- When `POST /api/jobs/{job_id}/retry-failed` is called, `retry_failed()` queries the job.
+- It validates that the job has retryable generation failures and atomically shifts its status from `COMPLETED_WITH_ERRORS` / `FAILED` back to `PROCESSING`.
+- The failed generation certificates are reset to `status = PENDING`.
+- A FastAPI `BackgroundTask` executes `process_job_background()`, which processes all `PENDING` certificates in 50-item batches, incrementing `attempts` from 1 to 2.
+- Upon completion, the job status updates to `COMPLETED` (or `COMPLETED_WITH_ERRORS` if any unfixable errors remain).
+
+### 4. Likely Interview Questions & Answers
+
+#### Q1: Why do you differentiate between `VALIDATION` failures and `GENERATION` failures when retrying?
+**Answer:**
+`VALIDATION` failures (such as missing recipient names or malformed email addresses) are deterministic data errors. Re-running the generation pipeline on bad data will always fail and needlessly consume CPU/GPU cycles. Conversely, `GENERATION` failures (such as temporary disk IO locks, memory pressure, or external font/rendering glitches) are transient operational errors. By selectively filtering for `failure_type == GENERATION`, the retry endpoint only attempts to resolve recoverable operational failures while safely skipping permanent input errors.
+
+#### Q2: How do you prevent race conditions if multiple clients call `retry-failed` simultaneously?
+**Answer:**
+We implement an atomic conditional SQL update inside `app/services/job_service.py`:
+`UPDATE generation_jobs SET status='PROCESSING' WHERE job_id=:id AND status IN ('COMPLETED_WITH_ERRORS', 'FAILED')`.
+If two requests arrive simultaneously, the database executes the atomic update sequentially: the first request matches the status, transitions it to `PROCESSING`, and affects 1 row. The second request matches 0 rows and immediately fails with `JobNotRetryableError` (returning `HTTP 409 Conflict`), preventing duplicate background workers from spawning.
+
+#### Q3: How is the demo failure switch implemented safely without polluting production logic?
+**Answer:**
+The demo failure switch (`ENABLE_DEMO_FAILURES`) is controlled via application configuration settings and evaluated only in the background worker (`job_processor.py`), completely decoupled from the core PDF rendering engine (`certificate_generator.py`). In demo mode, recipients named with a specific sentinel prefix (`FAILME`) trigger a simulated generation failure on attempt 1. Because the generator itself remains pure and deterministic, toggling the flag on or off has zero side effects on production PDF rendering.
+
+
 
 
 
